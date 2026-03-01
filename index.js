@@ -1,7 +1,6 @@
 /**
  * Inline Image Generation Extension for SillyTavern
- * * ФОРК: Оптимизировано для кастомных соотношений сторон (CCTV) и сторонних прокси.
- * Catches [IMG:GEN:{json}] tags in AI messages and generates images via configured API.
+ * * Catches [IMG:GEN:{json}] tags in AI messages and generates images via configured API.
  * Supports OpenAI-compatible and Gemini-compatible (nano-banana) endpoints.
  */
 
@@ -390,27 +389,33 @@ async function getUserAvatarBase64() {
 
 /**
  * Generate image via OpenAI-compatible endpoint
- * ФОРК: Поддержка динамического aspect_ratio и очистки промптов
  */
 async function generateImageOpenAI(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
     const url = `${settings.endpoint.replace(/\/$/, '')}/v1/images/generations`;
     
-    // ФОРК: Очистка промпта от артефактов и переносов строк
-    const cleanPrompt = prompt ? prompt.replace(/[\n\r]+/g, ' ').trim() : '';
-    const cleanStyle = style ? style.replace(/[\n\r]+/g, ' ').trim() : '';
-    const fullPrompt = cleanStyle ? `[Style: ${cleanStyle}] ${cleanPrompt}` : cleanPrompt;
+    // Combine style and prompt
+    let fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
     
-    // ФОРК: Прямой проброс aspect_ratio (например, "16:9") в size для прокси
+    // Map aspect ratio to size if provided in tag
     let size = settings.size;
+    let proxyAr = null;
     if (options.aspectRatio) {
-        size = options.aspectRatio; 
-    } else if (options.imageSize) {
-        size = options.imageSize;
+        proxyAr = options.aspectRatio;
+        if (options.aspectRatio === '16:9') size = '1792x1024';
+        else if (options.aspectRatio === '9:16') size = '1024x1792';
+        else if (options.aspectRatio === '1:1') size = '1024x1024';
+        else if (options.aspectRatio === '4:3') size = '1024x768';
+        else if (options.aspectRatio === '3:4') size = '768x1024';
+    }
+    
+    // ХАК ДЛЯ ПРОКСИ: Принудительно вшиваем --ar в текст (для OpenAI)
+    if (proxyAr && !fullPrompt.includes('--ar')) {
+        fullPrompt += ` --ar ${proxyAr}`;
     }
     
     const body = {
-        model: settings.model || "dall-e-3",
+        model: settings.model,
         prompt: fullPrompt,
         n: 1,
         size: size,
@@ -423,12 +428,6 @@ async function generateImageOpenAI(prompt, style, referenceImages = [], options 
         body.image = `data:image/png;base64,${referenceImages[0]}`;
     }
     
-    // ФОРК: Логирование исходящего запроса для удобной отладки сторонних прокси
-    console.log('--- [IIG] ОТПРАВКА ЗАПРОСА В OPENAI-API ---');
-    console.log(`[IIG] Endpoint: ${url}`);
-    console.log(`[IIG] Payload (JSON):\n`, JSON.stringify(body, null, 2));
-    console.log('---------------------------------------------');
-
     const response = await fetch(url, {
         method: 'POST',
         headers: {
@@ -440,12 +439,10 @@ async function generateImageOpenAI(prompt, style, referenceImages = [], options 
     
     if (!response.ok) {
         const text = await response.text();
-        console.error('--- [IIG] ОШИБКА API ---', text);
         throw new Error(`API Error (${response.status}): ${text}`);
     }
     
     const result = await response.json();
-    console.log('--- [IIG] ОТВЕТ API ПОЛУЧЕН ---', result);
     
     // Parse response - standard OpenAI format
     const dataList = result.data || [];
@@ -462,13 +459,7 @@ async function generateImageOpenAI(prompt, style, referenceImages = [], options 
         return `data:image/png;base64,${imageObj.b64_json}`;
     }
     
-    // ФОРК: Обработка случая, когда прокси игнорирует b64_json и возвращает прямой URL
-    try {
-        return await imageUrlToDataUrl(imageData);
-    } catch(e) {
-         console.warn('[IIG] Не удалось конвертировать URL в Base64 (CORS?), возвращаем прямой URL', e);
-         return imageData;
-    }
+    return imageData;
 }
 
 // Valid aspect ratios for Gemini/nano-banana
@@ -515,6 +506,13 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
     
     // Add prompt with style and reference instruction
     let fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
+    
+    // ХАК ДЛЯ ПРОКСИ: Принудительно вшиваем --ar в конец текста! 
+    // Многие прокси (EllyAI, Polza) игнорируют JSON настройки aspectRatio и читают только текст.
+    if (!fullPrompt.includes('--ar')) {
+        fullPrompt += ` --ar ${aspectRatio}`;
+    }
+    iigLog('INFO', `Final prompt text sent to API: ${fullPrompt}`);
     
     // If reference images provided, add instruction to copy appearance
     if (referenceImages.length > 0) {
@@ -907,14 +905,14 @@ async function parseImageTags(text, options = {}) {
         }
         
         try {
-            // ФОРК: Более агрессивная очистка JSON, включая переносы строк, которые часто ломают парсер
+            // Normalize JSON: AI sometimes uses single quotes, HTML entities, etc.
             let normalizedJson = instructionJson
                 .replace(/&quot;/g, '"')
                 .replace(/&apos;/g, "'")
                 .replace(/&#39;/g, "'")
                 .replace(/&#34;/g, '"')
                 .replace(/&amp;/g, '&')
-                .replace(/\n/g, '\\n')  
+                .replace(/\n/g, '\\n')
                 .replace(/\r/g, '\\r');
             
             const data = JSON.parse(normalizedJson);
@@ -1003,11 +1001,7 @@ async function parseImageTags(text, options = {}) {
         const tagOnly = text.substring(markerIndex, jsonEnd + 1);
         
         try {
-            // ФОРК: Поддержка очистки переносов строк и для старого формата
-            const normalizedJson = jsonStr
-                .replace(/'/g, '"')
-                .replace(/\n/g, '\\n')
-                .replace(/\r/g, '\\r');
+            const normalizedJson = jsonStr.replace(/'/g, '"').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
             const data = JSON.parse(normalizedJson);
             
             tags.push({
@@ -1279,14 +1273,7 @@ async function processMessageTags(messageId) {
             
             // Save image to file instead of keeping base64
             statusEl.textContent = 'Сохранение...';
-            
-            // ФОРК: Защита на случай, если внешний API вернул обычную ссылку (CORS fallback)
-            let imagePath;
-            if (dataUrl.startsWith('data:')) {
-                 imagePath = await saveImageToFile(dataUrl);
-            } else {
-                 imagePath = dataUrl; // fallback на внешний URL от прокси
-            }
+            const imagePath = await saveImageToFile(dataUrl);
             
             // Replace placeholder with actual image
             const img = document.createElement('img');
@@ -1441,13 +1428,7 @@ async function regenerateMessageImages(messageId) {
                 );
                 
                 statusEl.textContent = 'Сохранение...';
-                
-                let imagePath;
-                if (dataUrl.startsWith('data:')) {
-                     imagePath = await saveImageToFile(dataUrl);
-                } else {
-                     imagePath = dataUrl;
-                }
+                const imagePath = await saveImageToFile(dataUrl);
                 
                 const img = document.createElement('img');
                 img.className = 'iig-generated-image';
